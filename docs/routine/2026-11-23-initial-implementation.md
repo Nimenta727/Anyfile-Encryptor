@@ -17,3 +17,9 @@ Test suite is included but has **not yet been executed in a dependency-equipped 
 2. Add fuzz tests, cross-implementation known-answer vectors and crash-safe output cleanup.
 3. Conduct independent review of file format, key schedule, memory usage and filesystem race conditions.
 4. Consider an optional misuse-resistant AEAD and a separate post-quantum recipient-key wrapping format.
+
+## CI follow-up (2026-11-23)
+
+- Added `.github/workflows/tests.yml` with Python 3.10/3.12 pytest runs on Ubuntu, Windows and macOS.
+- CI execution results are pending; adding a workflow does not establish that tests pass.
+- Next: inspect Actions results, fix failures, then run additional fuzz and interoperability tests.
