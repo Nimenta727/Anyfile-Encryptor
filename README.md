@@ -2,6 +2,17 @@
 
 Experimental authenticated file encryption. **Not independently audited; do not rely on either prototype for irreplaceable or highly sensitive information.**
 
+## Desktop preview / 桌面实验版
+
+Choose a file, enter and confirm three secrets, then generate a ciphertext and a separate random keyfile. Recover using both outputs and all three secrets. No network or automatic overwrite; one regular file per operation. Experimental, not audited.
+
+```bash
+python -m pip install --only-binary=cryptography,argon2-cffi-bindings,cffi -c constraints-runtime.txt -r requirements.txt
+python -m desktop.app
+```
+
+See [desktop guide](docs/DESKTOP.md). Windows x64 portable preview is built by the Desktop preview GitHub Actions workflow; download the artifact only after a successful build.
+
 ## HDT v2 audit remediation candidate
 
 64 KiB random keyfile (eight-axis shape), plus three NFC-normalized secret segments; Argon2id, HKDF-SHA256, AES-256-GCM-SIV, key commitment and authenticated header. See [protocol and security limits](docs/HDT_V2.md).

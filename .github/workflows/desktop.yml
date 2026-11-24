@@ -1,0 +1,44 @@
+name: Desktop preview
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux-gui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --only-binary=cryptography,argon2-cffi-bindings,cffi -c constraints-runtime.txt -r requirements.txt
+      - run: sudo apt-get update && sudo apt-get install -y xvfb xauth
+      - run: python -m pytest -q tests/test_desktop.py
+      - run: PYTHONPATH=. xvfb-run -a python tests/desktop_smoke.py
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+      - run: python -m pip install --only-binary=cryptography,argon2-cffi-bindings,cffi -c constraints-runtime.txt -r requirements.txt
+      - run: python -m pip install pyinstaller==6.16.0
+      - run: python -m pytest -q tests/test_desktop.py
+      - run: python -m core.hdt self-test
+      - run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name MOSAIC-HDT desktop_main.py
+      - name: Package preview and checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash dist/MOSAIC-HDT.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  MOSAIC-HDT.exe" | Set-Content -Encoding ascii dist/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MOSAIC-HDT-Windows-x64-preview
+          path: |
+            dist/MOSAIC-HDT.exe
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
