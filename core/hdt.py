@@ -28,6 +28,10 @@ HEADER = struct.Struct(">8sHH16s32s32s")
 RECORD = struct.Struct(">BQI")
 COUNTS = struct.Struct(">QQ")
 VERSION, SUITE = 2, 1
+# Protocol IDs are immutable; values are KiB, not MB.
+SUITES = {1: 65536, 2: 262144, 3: 524288, 4: 1048576}
+DEFAULT_MEMORY_BUDGET_MIB = 256
+_random_bytes = os.urandom
 CHUNK = 1 << 20
 MAX_CHUNKS = (1 << 32) - 1
 ZERO = bytes(12)
@@ -70,32 +74,39 @@ def mac(key, data):
     return hmac.digest(key, data, "sha256")
 
 
-def expand(prk, label, file_id, *fields):
-    info = encode(b"MOSAIC-HDT/v2", label, file_id, struct.pack(">H", SUITE), *fields)
+def suite_memory(suite):
+    if type(suite) is not int or suite not in SUITES:
+        raise FormatError("Unsupported container suite")
+    return SUITES[suite]
+
+
+def expand(prk, label, file_id, *fields, suite=SUITE):
+    suite_memory(suite)
+    info = encode(b"MOSAIC-HDT/v2", label, file_id, struct.pack(">H", suite), *fields)
     return HKDFExpand(algorithm=hashes.SHA256(), length=32, info=info).derive(prk)
 
 
-def password_key(parts, salt):
+def password_key(parts, salt, suite=SUITE):
     return hash_secret_raw(encode(*normalized(parts)), salt, time_cost=3,
-                           memory_cost=65536, parallelism=4, hash_len=32,
+                           memory_cost=suite_memory(suite), parallelism=4, hash_len=32,
                            type=Type.ID, version=19)
 
 
-def credential_keys(material, parts, file_id, salt_p, salt_t):
+def credential_keys(material, parts, file_id, salt_p, salt_t, suite=SUITE):
     if len(material) != KEY_BYTES:
         raise ValueError("Invalid keyfile material length")
     kt = mac(salt_t, material)
-    kp = password_key(parts, salt_p)
+    kp = password_key(parts, salt_p, suite)
     prk = mac(kt, kp)
-    return expand(prk, b"wrap", file_id), expand(prk, b"commit", file_id)
+    return expand(prk, b"wrap", file_id, suite=suite), expand(prk, b"commit", file_id, suite=suite)
 
 
-def data_keys(root, file_id):
-    return tuple(expand(root, purpose, file_id) for purpose in (b"header", b"data", b"final"))
+def data_keys(root, file_id, suite=SUITE):
+    return tuple(expand(root, purpose, file_id, suite=suite) for purpose in (b"header", b"data", b"final"))
 
 
-def chunk_key(data_key, file_id, index):
-    return expand(data_key, b"chunk", file_id, struct.pack(">Q", index))
+def chunk_key(data_key, file_id, index, suite=SUITE):
+    return expand(data_key, b"chunk", file_id, struct.pack(">Q", index), suite=suite)
 
 
 def self_test():
@@ -122,7 +133,11 @@ def atomic_output(destination):
     destination = Path(destination)
     if os.path.lexists(destination):
         raise FileExistsError(destination)
-    fd, name = tempfile.mkstemp(prefix=".mosaic-hdt-", suffix=".tmp", dir=destination.parent)
+    if os.name == "nt":
+        from .windows_private import private_temp
+        fd, name = private_temp(destination.parent)
+    else:
+        fd, name = tempfile.mkstemp(prefix=".mosaic-hdt-", suffix=".tmp", dir=destination.parent)
     try:
         with os.fdopen(fd, "wb") as out:
             yield out
@@ -161,20 +176,26 @@ def read_keyfile(path):
     return raw[35:-32]
 
 
-def encrypt(source, destination, keyfile, parts):
+def encrypt(source, destination, keyfile, parts, *, suite=SUITE):
+    suite_memory(suite)
+    if os.path.lexists(destination):
+        raise FileExistsError(destination)
     self_test()
     check_new_parameters(parts)
     regular_source(source)
     material = read_keyfile(keyfile)
-    file_id, salt_p, salt_t = os.urandom(16), os.urandom(32), os.urandom(32)
-    head = HEADER.pack(MAGIC, VERSION, SUITE, file_id, salt_p, salt_t)
-    kw, kc = credential_keys(material, parts, file_id, salt_p, salt_t)
-    root = os.urandom(32)
+    file_id, salt_p, salt_t = _random_bytes(16), _random_bytes(32), _random_bytes(32)
+    head = HEADER.pack(MAGIC, VERSION, suite, file_id, salt_p, salt_t)
+    kw, kc = credential_keys(material, parts, file_id, salt_p, salt_t, suite)
+    del material
+    root = _random_bytes(32)
     commitment = mac(kc, head)
     wrapped = AESGCMSIV(kw).encrypt(ZERO, root, head + commitment)
-    kh, kd, kf = data_keys(root, file_id)
+    kh, kd, kf = data_keys(root, file_id, suite)
+    del root, kw, kc
     prefix = head + commitment + wrapped
     full_header = prefix + mac(kh, prefix)
+    del kh
     digest = hashlib.sha256(full_header).digest()
     count = total = 0
     with Path(source).open("rb") as inp, atomic_output(destination) as out:
@@ -186,7 +207,7 @@ def encrypt(source, destination, keyfile, parts):
             if count >= MAX_CHUNKS:
                 raise ValueError("File exceeds format limits")
             record = RECORD.pack(1, count, len(block))
-            ciphertext = AESGCMSIV(chunk_key(kd, file_id, count)).encrypt(ZERO, block, digest + record)
+            ciphertext = AESGCMSIV(chunk_key(kd, file_id, count, suite)).encrypt(ZERO, block, digest + record)
             out.write(record + ciphertext)
             count += 1
             total += len(block)
@@ -198,25 +219,34 @@ def encrypt(source, destination, keyfile, parts):
         out.write(b"\x02" + AESGCMSIV(kf).encrypt(ZERO, COUNTS.pack(count, total), digest + b"\x02"))
 
 
-def decrypt(source, destination, keyfile, parts):
+def decrypt(source, destination, keyfile, parts, *, max_memory_mib=DEFAULT_MEMORY_BUDGET_MIB):
+    if max_memory_mib not in (64, 256, 512, 1024):
+        raise ValueError("Choose a supported local memory budget")
+    if os.path.lexists(destination):
+        raise FileExistsError(destination)
     self_test()
     regular_source(source)
-    material = read_keyfile(keyfile)
     try:
         with Path(source).open("rb") as inp:
             head = exact(inp, HEADER.size)
             magic, version, suite, file_id, salt_p, salt_t = HEADER.unpack(head)
-            if (magic, version, suite) != (MAGIC, VERSION, SUITE):
-                raise FormatError("Unsupported container format or suite")
+            if (magic, version) != (MAGIC, VERSION):
+                raise FormatError("Unsupported container format")
+            if suite_memory(suite) > max_memory_mib * 1024:
+                raise FormatError("Suite exceeds local memory budget; explicitly authorize a higher budget")
             commitment, wrapped, header_mac = exact(inp, 32), exact(inp, 48), exact(inp, 32)
-            kw, kc = credential_keys(material, parts, file_id, salt_p, salt_t)
+            material = read_keyfile(keyfile)
+            kw, kc = credential_keys(material, parts, file_id, salt_p, salt_t, suite)
+            del material
             if not hmac.compare_digest(commitment, mac(kc, head)):
                 raise FormatError(AUTH_ERROR)
             root = AESGCMSIV(kw).decrypt(ZERO, wrapped, head + commitment)
-            kh, kd, kf = data_keys(root, file_id)
+            kh, kd, kf = data_keys(root, file_id, suite)
+            del root, kw, kc
             prefix = head + commitment + wrapped
             if not hmac.compare_digest(header_mac, mac(kh, prefix)):
                 raise FormatError(AUTH_ERROR)
+            del kh
             digest = hashlib.sha256(prefix + header_mac).digest()
             count = total = 0
             short_seen = False
@@ -235,7 +265,7 @@ def decrypt(source, destination, keyfile, parts):
                     if index != count or not 1 <= length <= CHUNK:
                         raise FormatError(AUTH_ERROR)
                     ciphertext = exact(inp, length + 16)
-                    block = AESGCMSIV(chunk_key(kd, file_id, count)).decrypt(ZERO, ciphertext, digest + record)
+                    block = AESGCMSIV(chunk_key(kd, file_id, count, suite)).decrypt(ZERO, ciphertext, digest + record)
                     out.write(block)
                     count += 1
                     total += length
@@ -255,10 +285,21 @@ def prompt_parameters(confirm=False):
     return values
 
 
+def list_residuals(directory):
+    """Report candidates only; a live process may still own any candidate."""
+    import re
+    with os.scandir(directory) as entries:
+        return sorted(entry.name for entry in entries
+                      if re.fullmatch(r"\.mosaic-hdt-[A-Za-z0-9_-]+\.tmp", entry.name)
+                      and entry.is_file(follow_symlinks=False))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Experimental MOSAIC-HDT v2")
     subs = parser.add_subparsers(dest="action", required=True)
     subs.add_parser("self-test")
+    residuals = subs.add_parser("list-residuals", help="List possible crash remnants; never deletes")
+    residuals.add_argument("directory")
     keygen = subs.add_parser("generate-key")
     keygen.add_argument("destination")
     for name in ("encrypt", "decrypt"):
@@ -266,16 +307,30 @@ def main():
         p.add_argument("source")
         p.add_argument("destination")
         p.add_argument("--keyfile", required=True)
+        if name == "encrypt":
+            p.add_argument("--suite", type=int, choices=tuple(SUITES), default=2)
+        else:
+            p.add_argument("--max-memory-mib", type=int, choices=(64, 256, 512, 1024), default=DEFAULT_MEMORY_BUDGET_MIB)
     args = parser.parse_args()
     try:
         self_test()
         if args.action == "generate-key":
             generate_keyfile(args.destination)
+        elif args.action == "list-residuals":
+            for name in list_residuals(args.directory):
+                print(repr(name))
+            print("Do not remove candidates until all encryption processes have stopped.")
         elif args.action in ("encrypt", "decrypt"):
             if args.action == "encrypt":
                 print("Use three independent randomly generated secrets; minimum length is not an entropy guarantee.")
             parts = prompt_parameters(args.action == "encrypt")
-            (encrypt if args.action == "encrypt" else decrypt)(args.source, args.destination, args.keyfile, parts)
+            try:
+                if args.action == "encrypt":
+                    encrypt(args.source, args.destination, args.keyfile, parts, suite=args.suite)
+                else:
+                    decrypt(args.source, args.destination, args.keyfile, parts, max_memory_mib=args.max_memory_mib)
+            finally:
+                del parts
         print("Completed.")
     except (OSError, ValueError, RuntimeError, getpass.GetPassWarning) as exc:
         parser.exit(1, f"Error: {exc}\n")
