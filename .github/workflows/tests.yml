@@ -14,5 +14,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: python -m pip install -r requirements.txt
+      - run: python -m pip install --only-binary=cryptography,argon2-cffi-bindings,cffi -c constraints-runtime.txt -r requirements.txt
+      - run: python -m pip check
+      - run: python -m core.hdt self-test
       - run: python -m pytest -q
+
+  formal-fault-lab:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --only-binary=cryptography,argon2-cffi-bindings,cffi -c constraints-runtime.txt -r requirements.txt
+      - run: sudo apt-get update && sudo apt-get install -y z3
+      - run: z3 --version
+      - run: python -m verification.protocol_smt
+      - run: python -m verification.check_stage3
+      - run: python -m verification.fault_lab
