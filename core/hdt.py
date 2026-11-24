@@ -29,7 +29,9 @@ RECORD = struct.Struct(">BQI")
 COUNTS = struct.Struct(">QQ")
 VERSION, SUITE = 2, 1
 # Protocol IDs are immutable; values are KiB, not MB.
-SUITES = {1: 65536, 2: 262144, 3: 524288, 4: 1048576}
+SUITES = {1: 65536, 2: 262144, 3: 524288, 4: 1048576,
+          257: 65536, 258: 262144, 259: 524288, 260: 1048576}
+COMMITMENT_SUITES = frozenset((257, 258, 259, 260))
 DEFAULT_MEMORY_BUDGET_MIB = 256
 _random_bytes = os.urandom
 CHUNK = 1 << 20
@@ -40,6 +42,10 @@ AUTH_ERROR = "Authentication failed: incorrect credentials or invalid container"
 
 class FormatError(ValueError):
     pass
+
+
+class PublishedOutputError(OSError):
+    """Complete output is visible, but post-publication cleanup/durability failed."""
 
 
 def encode(*fields):
@@ -78,6 +84,20 @@ def suite_memory(suite):
     if type(suite) is not int or suite not in SUITES:
         raise FormatError("Unsupported container suite")
     return SUITES[suite]
+
+
+def commitment_size(suite):
+    suite_memory(suite)
+    return 64 if suite in COMMITMENT_SUITES else 32
+
+
+def make_commitment(kw, kc, head, suite):
+    suite_memory(suite)
+    if len(kw) != 32 or len(kc) != 32 or len(head) != HEADER.size:
+        raise ValueError("Invalid commitment inputs")
+    if suite in COMMITMENT_SUITES:
+        return hashlib.sha512(encode(b"MOSAIC-HDT/commitment-sha512/v1", head, kw, kc)).digest()
+    return mac(kc, head)
 
 
 def expand(prk, label, file_id, *fields, suite=SUITE):
@@ -138,18 +158,33 @@ def atomic_output(destination):
         fd, name = private_temp(destination.parent)
     else:
         fd, name = tempfile.mkstemp(prefix=".mosaic-hdt-", suffix=".tmp", dir=destination.parent)
+    published = False
     try:
         with os.fdopen(fd, "wb") as out:
             yield out
             out.flush()
             os.fsync(out.fileno())
-        # No replacement or unsafe fallback. Unsupported filesystems fail closed.
+        # Successful link is the commit point; never replace or roll back it.
         os.link(name, destination)
+        published = True
     finally:
         try:
             os.unlink(name)
         except FileNotFoundError:
             pass
+        except OSError as exc:
+            if published:
+                raise PublishedOutputError("Complete output published; temporary alias cleanup failed") from exc
+            raise
+    if os.name == "posix":
+        try:
+            dfd = os.open(destination.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError as exc:
+            raise PublishedOutputError("Complete output published; directory durability not confirmed") from exc
 
 
 def regular_source(path):
@@ -189,7 +224,7 @@ def encrypt(source, destination, keyfile, parts, *, suite=SUITE):
     kw, kc = credential_keys(material, parts, file_id, salt_p, salt_t, suite)
     del material
     root = _random_bytes(32)
-    commitment = mac(kc, head)
+    commitment = make_commitment(kw, kc, head, suite)
     wrapped = AESGCMSIV(kw).encrypt(ZERO, root, head + commitment)
     kh, kd, kf = data_keys(root, file_id, suite)
     del root, kw, kc
@@ -234,11 +269,11 @@ def decrypt(source, destination, keyfile, parts, *, max_memory_mib=DEFAULT_MEMOR
                 raise FormatError("Unsupported container format")
             if suite_memory(suite) > max_memory_mib * 1024:
                 raise FormatError("Suite exceeds local memory budget; explicitly authorize a higher budget")
-            commitment, wrapped, header_mac = exact(inp, 32), exact(inp, 48), exact(inp, 32)
+            commitment, wrapped, header_mac = exact(inp, commitment_size(suite)), exact(inp, 48), exact(inp, 32)
             material = read_keyfile(keyfile)
             kw, kc = credential_keys(material, parts, file_id, salt_p, salt_t, suite)
             del material
-            if not hmac.compare_digest(commitment, mac(kc, head)):
+            if not hmac.compare_digest(commitment, make_commitment(kw, kc, head, suite)):
                 raise FormatError(AUTH_ERROR)
             root = AESGCMSIV(kw).decrypt(ZERO, wrapped, head + commitment)
             kh, kd, kf = data_keys(root, file_id, suite)

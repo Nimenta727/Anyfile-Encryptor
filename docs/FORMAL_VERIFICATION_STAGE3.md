@@ -1,0 +1,37 @@
+# HDT explicit commitment candidate and formal/OS verification
+
+Status: research candidate; not independently audited, no production approval.
+
+## Chosen-key commitment reduction
+For suites 257–260, define E as the existing injective u32be length-prefixed tuple encoder, d as ASCII MOSAIC-HDT/commitment-sha512/v1, H as the 92-byte header, and KW,Kc as the 32-byte domain-separated derived keys. C=SHA-512(E(d,H,KW,Kc)), all 64 bytes. Given an adversary producing a fixed H, a fixed C, and two distinct KW values (with arbitrary corresponding Kc values) accepted by the commitment check, output X=E(d,H,KW1,Kc1) and Y=E(d,H,KW2,Kc2). Injectivity gives X!=Y; equality of C gives SHA-512(X)=SHA-512(Y). This is a direct black-box collision reduction, with the same success probability and minor encoding overhead. It also binds Kc conditional on no hash collision. On a fixed accepted container, equal KW, H, C and W imply equal deterministic unwrap result; the remainder of parsing and decryption is deterministic. It does not prove injectivity of credential derivation: different raw credentials could yield identical normalized credentials or identical derived keys. No need for a chosen-key HMAC PRF assumption for this *binding* claim; existing credential combiner assumptions remain. Collision resistance alone does not establish secrecy of the public key-dependent commitment. Joint pseudorandomness of HKDF outputs and suitable SHA-512 hidden-input/random-oracle assumptions, credential entropy, AEAD security, and freshness remain obligations for confidentiality. This is not a full computational security proof or a proof SHA-512 has no collisions. Generic collision work factor for SHA-512 is ~2^256 operations; effective full-protocol security can be much lower (credential entropy, 256-bit keys, 128-bit tags, concrete multi-user bounds). Same-container ambiguity only: not sender identity, replay prevention, or rollback resistance.
+Reference: NIST hash functions https://csrc.nist.gov/Projects/Hash-Functions ; Albertini et al. USENIX Security 2022 https://www.usenix.org/conference/usenixsecurity22/presentation/albertini ; RFC 5869, 9106, 8452.
+
+## Wire compatibility
+Suite IDs 257,258,259,260 use 64,256,512,1024 MiB Argon2id respectively. IDs 1–4 keep HMAC commitment and byte-for-byte existing vectors. Header H remains 92 B; C is now 64 B for new suites, W 48 B and M 32 B: 236 B total, fixed container overhead 269 B. Existing AAD and header digest cover the full C. No automatic fallback, no change to CLI/API defaults. Old implementations reject new suites. Use opt-in only on disposable test data. New SHA-512 output is public and supports joint offline guesses just as the old commitment already did.
+
+## Machine-checked abstract protocol
+verification/protocol_smt.py uses SMT-LIB and Z3 4.13.3 locally. Integer bounds use real CHUNK and MAX; initial-state and inductive-step obligations, authenticated prefix length, final count/length and EOF, memory budget before KDF, header commitment and MAC gates, and publish-or-fail control flow. Successful data/final tags abstract unforgeable genuine records for a fixed honest header; no primitive circuit, parser byte refinement, arbitrary malicious-header indistinguishability game, or filesystem liveness is encoded. The proof is inductive over any number of modeled steps within the protocol bounds, not exhaustive execution of the actual Python program. The commitment portion uses an injective datatype constructor and an uninterpreted hash with an explicit local no-collision assumption; checks the reduction logic, not SHA-512 collision resistance. 13 expected UNSAT obligations, 4 expected SAT controls (two valid transitions, a deliberately broken early-publish transition, and removal of the collision assumption). All 17 returned expected statuses locally. No claim of complete machine-verified implementation or mechanized computational reduction.
+
+## Publication and OS semantics
+Successful no-replace hard link is the commit point. Before it, normal exceptions remove the temporary file if possible. After it, never delete the completed output as rollback; a failed alias cleanup or POSIX parent directory fsync raises PublishedOutputError to signal complete visible output but uncertain cleanup/durability. Process kill may leave a private plaintext temp or a second name of the same completed inode. List residuals without deletion; remove only confirmed abandoned names after stopping/joining workers. File fsync is before link, directory fsync after unlink on POSIX. Power-loss durability depends on volume/filesystem/storage; Windows directory durability not established. Trusted destination parent required; adversarial parent mutation, physical storage faults, memory limits across concurrent KDFs and endpoint compromise remain out of scope. No ENOSPC or real power-cut test performed; EFBIG is a real kernel file-size limit and EIO/EACCES are injected exceptions, not hardware failures.
+
+## Reproduction and observed evidence (2026-11-24)
+Local exact baseline core Git blob 89e2a3ae8b364803c0764920e5db5e8e3f623407; tested revised core blob ea669539162ecd9bb82203d58935451c6e3118b5. Linux 6.18.57 x86_64 overlay, Python 3.13.5, cryptography 46.0.4, argon2-cffi 25.1.0, libz3 4.13.3.0. CI pinned dependency environments separate from this local run.
+
+- python -m verification.protocol_smt : all 17 statuses as expected.
+- python -m verification.check_stage3 : all eight suites encrypt/decrypt public fixture; four new commitment tamper cases rejected, no output; injected file fsync failure before commit, directory fsync and alias unlink failures after commit behaved as expected.
+- python -m verification.fault_lab : kill during partial decrypted write, immediately before link, immediately after link (complete output plus alias); private temp permissions checked; five rounds x six real publication processes, exactly one complete winner in each; four full concurrent encryption processes, one winner and verified decrypt; real RLIMIT_FSIZE/EFBIG failure without publication; final successful recovery from untouched encrypted/source fixtures.
+- All tests use synthetic data, not actual user files. The 3-byte fixture legacy suite SHA-256 values matched the previous recorded vector hashes, new fixtures are same-implementation regression evidence (not new independent C vectors).
+
+| ID | SHA-256 of public 3-byte fixture container |
+|---|---|
+| 1 | bd0aa3adc330a17ebf9a3339b9606a27722b3ddb5e950c0215b127df0d6eed6f |
+| 2 | fa432f95257ccf7f9f6c1fff8ea4fa3de7eaee22deb81f0a16a46f60812e80b6 |
+| 3 | e52d9d1a852180770adddd03af431882e5fd540cf1bd46cc93ffa6d1fd30595c |
+| 4 | 395be22dd9ab6692633c6c7c65c1818735825c81cd95392846eccd3c56115460 |
+| 257 | 93b6f9716944fcf41a8a782b85e640bb8b784749a3160b3c6dd5c1fed34c6e34 |
+| 258 | 98a861210e987770bc68201a4868c21a06bbd3a4665a6024323c448f02ca0227 |
+| 259 | 6700ab6b2c18df70a44cf33c731493d797a3080d324e549e87eaffc09fd08648 |
+| 260 | 7fc75af2111040d44731462ddb8a1eacf18b3a00fa59b1d26fae18b275ec9003 |
+
+Remaining: prove source refinement, mechanize computational games and secrecy of the new commitment, produce independent new-suite vectors, test NTFS/APFS/ext4 and controlled real ENOSPC and power-loss, add process-wide KDF budget, verify OS ACL and hostile-directory semantics, finish dependency artifact hash lock and independent audit. No release or merge until review.

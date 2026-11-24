@@ -18,3 +18,6 @@ verification/stream_model.py abstracts records as unforgeable tokens from one ge
 
 ## 5. Remaining proof and audit obligations
 Independent expert review of dual-PRF/extractor assumptions, chosen-key commitment, concrete multi-user bounds, parser refinement, Unicode normalization, allocation/resource budget, dependency CVEs and OS ACL behavior. No third-party audit commissioned or received. Cite RFC 5869, RFC 9106, RFC 8452, Backendal et al. CRYPTO 2023 (ePrint 2023/861), Albertini et al. USENIX Security 2022 (How to Abuse and Fix Authenticated Encryption Without Key Commitment).
+
+## Stage 3 follow-up
+See [explicit commitment and formal/OS verification](FORMAL_VERIFICATION_STAGE3.md). Suites 257–260 use the full SHA-512 hash of the canonical header and both separated keys. The chosen-key binding reduction is conditional on SHA-512 collision resistance. SMT control-state invariants have been tested with Z3, but not source refinement or a complete computational proof. Legacy suites remain unchanged.
